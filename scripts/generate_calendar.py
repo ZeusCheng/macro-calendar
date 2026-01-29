@@ -165,14 +165,17 @@ def _get_with_retries(
 # -----------------------
 # Data sources
 # -----------------------
-
 def fetch_bls_cpi_and_nfp(year: int) -> tuple[list[datetime], list[datetime]]:
     """
     BLS schedule page includes dates for CPI & Employment Situation (NFP).
     Assumption:
       - CPI: 08:30 ET
       - Employment Situation: 08:30 ET
-    Robust matching because BLS title strings vary.
+
+    IMPORTANT:
+      BLS schedule table column order can be either:
+        (Date, Release) OR (Release, Date)
+      So we detect which column contains the date.
     """
     url = f"https://www.bls.gov/schedule/{year}/home.htm"
     headers = dict(BROWSER_HEADERS)
@@ -188,38 +191,56 @@ def fetch_bls_cpi_and_nfp(year: int) -> tuple[list[datetime], list[datetime]]:
     cpi_tp: list[datetime] = []
     nfp_tp: list[datetime] = []
 
-    date_pat = re.compile(r"([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})")
+    # match "January 14, 2026" (case-insensitive)
+    date_pat = re.compile(r"([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})", re.I)
 
     def norm(s: str) -> str:
         return re.sub(r"\s+", " ", s.strip()).lower()
 
     def is_cpi(title: str) -> bool:
         t = norm(title)
-        # CPI 常見各種寫法：Consumer Price Index / CPI / CPI-U / CPI Summary...
         return ("consumer price index" in t) or (re.search(r"\bcpi\b", t) is not None) or ("cpi-u" in t)
 
     def is_nfp(title: str) -> bool:
         t = norm(title)
-        # 非農常見：Employment Situation / The Employment Situation / Employment Situation Summary...
         return ("employment situation" in t) or ("the employment situation" in t)
+
+    # Helper: parse date string -> Taipei datetime (assume 08:30 ET)
+    def to_taipei(date_text: str) -> datetime | None:
+        m = date_pat.search(date_text)
+        if not m:
+            return None
+        dt_ny = datetime.strptime(m.group(0), "%B %d, %Y").replace(
+            hour=8, minute=30, second=0, tzinfo=TZ_NY
+        )
+        return dt_ny.astimezone(TZ_TAIPEI)
+
+    samples: list[str] = []
 
     for tr in rows:
         cols = [td.get_text(" ", strip=True) for td in tr.find_all(["th", "td"])]
         if len(cols) < 2:
             continue
 
-        release = cols[0]
-        date_str = " ".join(cols[1:])  # 日期欄後面可能還有其他資訊，合併找日期
+        # Decide which column is date
+        # Case A: col0 is date -> release in col1
+        # Case B: col1 (or later) contains date -> release in col0
+        dt_tp = None
+        release = ""
 
-        m = date_pat.search(date_str)
-        if not m:
-            continue
+        dt_tp = to_taipei(cols[0])
+        if dt_tp is not None:
+            # Date is in first column
+            release = cols[1]
+        else:
+            # Try the rest columns for date (sometimes date spans multiple cols)
+            dt_tp = to_taipei(" ".join(cols[1:]))
+            if dt_tp is None:
+                continue
+            release = cols[0]
 
-        # 08:30 ET
-        dt_ny = datetime.strptime(m.group(0), "%B %d, %Y").replace(
-            hour=8, minute=30, second=0, tzinfo=TZ_NY
-        )
-        dt_tp = dt_ny.astimezone(TZ_TAIPEI)
+        if release:
+            samples.append(norm(release))
 
         if is_cpi(release):
             cpi_tp.append(dt_tp)
@@ -230,20 +251,10 @@ def fetch_bls_cpi_and_nfp(year: int) -> tuple[list[datetime], list[datetime]]:
     nfp_tp = sorted(set(nfp_tp))
 
     if not cpi_tp:
-        sample = []
-        for tr in rows[:12]:
-            tds = tr.find_all(["th", "td"])
-            if tds:
-                sample.append(norm(tds[0].get_text(" ", strip=True)))
-        raise RuntimeError(f"BLS parse failed: CPI list empty. Sample titles: {sample}")
+        raise RuntimeError(f"BLS parse failed: CPI list empty. Sample release titles: {samples[:12]}")
 
     if not nfp_tp:
-        sample = []
-        for tr in rows[:12]:
-            tds = tr.find_all(["th", "td"])
-            if tds:
-                sample.append(norm(tds[0].get_text(" ", strip=True)))
-        raise RuntimeError(f"BLS parse failed: NFP list empty. Sample titles: {sample}")
+        raise RuntimeError(f"BLS parse failed: NFP list empty. Sample release titles: {samples[:12]}")
 
     return cpi_tp, nfp_tp
 
