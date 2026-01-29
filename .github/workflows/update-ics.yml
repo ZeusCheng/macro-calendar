@@ -1,9 +1,7 @@
 name: Update ICS (US Macro Calendar)
 
-on:
-  workflow_dispatch: {}
-  schedule:
-    - cron: "20 1 * * *"   # 每天 UTC 01:20（台北約 09:20）
+on: {}
+
 
 permissions:
   contents: write
