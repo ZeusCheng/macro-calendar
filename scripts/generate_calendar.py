@@ -56,7 +56,6 @@ FOMC_STATEMENT_DATES_2026 = [
     "2026-12-09",
 ]
 
-
 # Common headers to avoid 403 blocks in GitHub Actions
 BROWSER_HEADERS = {
     "User-Agent": (
@@ -97,10 +96,7 @@ def _stable_uid(summary: str, dtstart: datetime) -> str:
 
 
 def _escape_ics_text(text: str) -> str:
-    """
-    Basic escaping for ICS text fields.
-    Newlines become \\n
-    """
+    """Basic escaping for ICS text fields (newlines -> \\n)."""
     return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
 
 
@@ -147,7 +143,13 @@ def _event_to_ics_lines(ev: Event) -> list[str]:
 # HTTP helpers
 # -----------------------
 
-def _get_with_retries(url: str, headers: dict[str, str], timeout: int = 30, retries: int = 3, backoff_sec: float = 1.2) -> requests.Response:
+def _get_with_retries(
+    url: str,
+    headers: dict[str, str],
+    timeout: int = 30,
+    retries: int = 3,
+    backoff_sec: float = 1.2,
+) -> requests.Response:
     last_err: Exception | None = None
     for i in range(retries):
         try:
@@ -156,7 +158,6 @@ def _get_with_retries(url: str, headers: dict[str, str], timeout: int = 30, retr
             return resp
         except Exception as e:
             last_err = e
-            # exponential-ish backoff
             time.sleep(backoff_sec * (i + 1))
     raise RuntimeError(f"HTTP request failed after {retries} retries: {url} ; last_err={last_err}")
 
@@ -171,6 +172,7 @@ def fetch_bls_cpi_and_nfp(year: int) -> tuple[list[datetime], list[datetime]]:
     Assumption:
       - CPI: 08:30 ET
       - Employment Situation: 08:30 ET
+    Robust matching because BLS title strings vary.
     """
     url = f"https://www.bls.gov/schedule/{year}/home.htm"
     headers = dict(BROWSER_HEADERS)
@@ -181,19 +183,33 @@ def fetch_bls_cpi_and_nfp(year: int) -> tuple[list[datetime], list[datetime]]:
 
     rows = soup.select("table tbody tr")
     if not rows:
-        raise RuntimeError("BLS schedule table not found; page structure may have changed.")
+        raise RuntimeError("BLS schedule table not found; page structure may have changed or blocked.")
 
     cpi_tp: list[datetime] = []
     nfp_tp: list[datetime] = []
 
     date_pat = re.compile(r"([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})")
 
+    def norm(s: str) -> str:
+        return re.sub(r"\s+", " ", s.strip()).lower()
+
+    def is_cpi(title: str) -> bool:
+        t = norm(title)
+        # CPI 常見各種寫法：Consumer Price Index / CPI / CPI-U / CPI Summary...
+        return ("consumer price index" in t) or (re.search(r"\bcpi\b", t) is not None) or ("cpi-u" in t)
+
+    def is_nfp(title: str) -> bool:
+        t = norm(title)
+        # 非農常見：Employment Situation / The Employment Situation / Employment Situation Summary...
+        return ("employment situation" in t) or ("the employment situation" in t)
+
     for tr in rows:
         cols = [td.get_text(" ", strip=True) for td in tr.find_all(["th", "td"])]
         if len(cols) < 2:
             continue
+
         release = cols[0]
-        date_str = cols[1]
+        date_str = " ".join(cols[1:])  # 日期欄後面可能還有其他資訊，合併找日期
 
         m = date_pat.search(date_str)
         if not m:
@@ -205,31 +221,41 @@ def fetch_bls_cpi_and_nfp(year: int) -> tuple[list[datetime], list[datetime]]:
         )
         dt_tp = dt_ny.astimezone(TZ_TAIPEI)
 
-        if "Consumer Price Index" in release:
+        if is_cpi(release):
             cpi_tp.append(dt_tp)
-        if "Employment Situation" in release:
+        if is_nfp(release):
             nfp_tp.append(dt_tp)
 
     cpi_tp = sorted(set(cpi_tp))
     nfp_tp = sorted(set(nfp_tp))
 
     if not cpi_tp:
-        raise RuntimeError("BLS parse failed: CPI list empty (maybe page structure changed).")
+        sample = []
+        for tr in rows[:12]:
+            tds = tr.find_all(["th", "td"])
+            if tds:
+                sample.append(norm(tds[0].get_text(" ", strip=True)))
+        raise RuntimeError(f"BLS parse failed: CPI list empty. Sample titles: {sample}")
+
     if not nfp_tp:
-        raise RuntimeError("BLS parse failed: NFP list empty (maybe page structure changed).")
+        sample = []
+        for tr in rows[:12]:
+            tds = tr.find_all(["th", "td"])
+            if tds:
+                sample.append(norm(tds[0].get_text(" ", strip=True)))
+        raise RuntimeError(f"BLS parse failed: NFP list empty. Sample titles: {sample}")
 
     return cpi_tp, nfp_tp
 
 
 def fetch_bea_gdp_and_pio(year: int) -> tuple[list[datetime], list[datetime]]:
     """
-    BEA release_dates.json structure is like:
+    BEA release_dates.json structure:
     {
       "Gross Domestic Product": {"release_dates": [...]},
       "Personal Income and Outlays": {"release_dates": [...]},
       ...
     }
-    Each date entry is ISO string with timezone offset.
     """
     url = "https://apps.bea.gov/API/signup/release_dates.json"
     headers = dict(BROWSER_HEADERS)
@@ -246,15 +272,12 @@ def fetch_bea_gdp_and_pio(year: int) -> tuple[list[datetime], list[datetime]]:
         return re.sub(r"\s+", " ", s.strip()).lower()
 
     def _find_key(target: str) -> str | None:
-        # exact first
         if target in data:
             return target
         t = _norm(target)
-        # case-insensitive exact
         for k in data.keys():
             if _norm(str(k)) == t:
                 return str(k)
-        # contains fallback
         for k in data.keys():
             if t in _norm(str(k)):
                 return str(k)
@@ -272,7 +295,7 @@ def fetch_bea_gdp_and_pio(year: int) -> tuple[list[datetime], list[datetime]]:
             if not isinstance(s, str):
                 continue
             try:
-                dt = datetime.fromisoformat(s)  # includes offset like +00:00
+                dt = datetime.fromisoformat(s)  # includes offset
             except Exception:
                 continue
             if dt.year == year:
