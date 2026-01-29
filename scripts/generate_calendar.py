@@ -2,24 +2,35 @@
 # -*- coding: utf-8 -*-
 
 """
-Generate US major macro calendar (.ics) for 2026 in Asia/Taipei timezone.
+Generate an Apple-compatible ICS calendar for major US macro releases (Taipei time).
 
-Sources:
-- BLS release schedule (CPI, Employment Situation): https://www.bls.gov/schedule/2026/home.htm
-- BEA release dates JSON (GDP, Personal Income and Outlays): https://apps.bea.gov/API/signup/release_dates.json
-- FOMC dates: hardcoded 2026 decision days (safer than parsing the webpage)
+Included (2026):
+- CPI (BLS schedule) - assumed 08:30 ET
+- Employment Situation / NFP (BLS schedule) - assumed 08:30 ET
+- FOMC statement day (hardcoded 2026 decision days) - assumed 14:00 ET
+- GDP (BEA release_dates.json)
+- Personal Income and Outlays / PCE (BEA release_dates.json)
 
 Output:
 - us-macro-2026-taipei.ics
 """
 
+from __future__ import annotations
+
 import hashlib
 import re
+import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
+
+
+# -----------------------
+# Config
+# -----------------------
 
 YEAR = 2026
 OUT_FILE = "us-macro-2026-taipei.ics"
@@ -28,174 +39,152 @@ TZ_TAIPEI = ZoneInfo("Asia/Taipei")
 TZ_NY = ZoneInfo("America/New_York")
 TZ_UTC = ZoneInfo("UTC")
 
+ALARMS_MINUTES = (30, 60)
+DEFAULT_DURATION_MIN = 15
+FOMC_DURATION_MIN = 30
 
-# ---------- iCalendar helpers ----------
+# FOMC decision (statement) days for 2026 (hardcoded for stability)
+# Assume statement at 14:00 ET on these days.
+FOMC_STATEMENT_DATES_2026 = [
+    "2026-01-28",
+    "2026-03-18",
+    "2026-04-29",
+    "2026-06-17",
+    "2026-07-29",
+    "2026-09-16",
+    "2026-10-28",
+    "2026-12-09",
+]
+
+
+# Common headers to avoid 403 blocks in GitHub Actions
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+}
+
+
+# -----------------------
+# ICS helpers
+# -----------------------
 
 def _fold_ics_line(line: str, limit: int = 75) -> str:
-    """
-    RFC5545 line folding: lines longer than 75 octets should be folded with CRLF + single space.
-    We approximate by character count (works well for our content).
-    """
+    """RFC5545 line folding: CRLF + space."""
     if len(line) <= limit:
         return line
-    out = []
+    out: list[str] = []
     while len(line) > limit:
         out.append(line[:limit])
         line = " " + line[limit:]
     out.append(line)
     return "\r\n".join(out)
 
-def _dt_local(dt: datetime) -> str:
-    # local time with seconds, no 'Z'
+
+def _fmt_local(dt: datetime) -> str:
     return dt.strftime("%Y%m%dT%H%M%S")
 
-def _dtstamp_utc() -> str:
-    return datetime.now(tz=TZ_UTC).strftime("%Y%m%dT%H%M%SZ")
 
 def _stable_uid(summary: str, dtstart: datetime) -> str:
-    """
-    Stable UID so updates don't create duplicates.
-    UID must be globally unique; use hash of summary+datetime.
-    """
     base = f"{summary}|{dtstart.isoformat()}"
     h = hashlib.sha1(base.encode("utf-8")).hexdigest()[:20]
     return f"fin-{h}@zeuscheng.github.io"
 
-def _escape_desc(text: str) -> str:
+
+def _escape_ics_text(text: str) -> str:
     """
-    iCalendar escaping:
-    - Newlines as \n
+    Basic escaping for ICS text fields.
+    Newlines become \\n
     """
     return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
 
-def add_event(
-    lines: list[str],
-    summary: str,
-    start_tp: datetime,
-    duration_minutes: int = 15,
-    description: str = "",
-    categories: list[str] | None = None,
-    alarms: tuple[int, ...] = (30, 60),
-):
-    end_tp = start_tp + timedelta(minutes=duration_minutes)
 
-    lines.extend([
+@dataclass(frozen=True)
+class Event:
+    summary: str
+    start_tp: datetime
+    duration_min: int
+    description: str
+    categories: tuple[str, ...]
+
+
+def _event_to_ics_lines(ev: Event) -> list[str]:
+    dt_end = ev.start_tp + timedelta(minutes=ev.duration_min)
+    lines = [
         "BEGIN:VEVENT",
-        f"UID:{_stable_uid(summary, start_tp)}",
-        f"DTSTAMP:{_dtstamp_utc()}",
-        f"SUMMARY:{summary}",
-        f"DTSTART;TZID=Asia/Taipei:{_dt_local(start_tp)}",
-        f"DTEND;TZID=Asia/Taipei:{_dt_local(end_tp)}",
-    ])
+        f"UID:{_stable_uid(ev.summary, ev.start_tp)}",
+        f"DTSTAMP:{datetime.now(tz=TZ_UTC).strftime('%Y%m%dT%H%M%SZ')}",
+        f"SUMMARY:{ev.summary}",
+        f"DTSTART;TZID=Asia/Taipei:{_fmt_local(ev.start_tp)}",
+        f"DTEND;TZID=Asia/Taipei:{_fmt_local(dt_end)}",
+    ]
 
-    if categories:
-        lines.append("CATEGORIES:" + ",".join(categories))
+    if ev.categories:
+        lines.append("CATEGORIES:" + ",".join(ev.categories))
 
-    if description:
-        lines.append(f"DESCRIPTION:{_escape_desc(description)}")
+    if ev.description:
+        lines.append("DESCRIPTION:" + _escape_ics_text(ev.description))
 
-    for m in alarms:
+    for m in ALARMS_MINUTES:
         lines.extend([
             "BEGIN:VALARM",
             "ACTION:DISPLAY",
-            f"DESCRIPTION:提醒：{summary}",
+            f"DESCRIPTION:提醒：{ev.summary}",
             f"TRIGGER:-PT{m}M",
             "END:VALARM",
         ])
 
     lines.append("END:VEVENT")
+    return lines
 
 
-# ---------- Data fetchers ----------
+# -----------------------
+# HTTP helpers
+# -----------------------
 
-def fetch_bls_cpi_and_nfp(year: int) -> tuple[list[datetime], list[datetime]]:
-    """
-    Parse BLS schedule page for a given year.
-    - CPI (Consumer Price Index)
-    - Employment Situation (NFP)
-    Default release time assumed 08:30 ET; convert to Taipei.
-    """
-def fetch_bls_cpi_and_nfp(year: int) -> tuple[list[datetime], list[datetime]]:
-    """
-    Parse BLS schedule page for a given year.
-    - CPI (Consumer Price Index)
-    - Employment Situation (NFP)
-    Default release time assumed 08:30 ET; convert to Taipei.
-    """
-    urls = [
-        f"https://www.bls.gov/schedule/{year}/home.htm",
-        f"https://www.bls.gov/schedule/{year}/home.htm",  # 備援可留同一個（或你想改成 http 也行）
-    ]
-
-    headers = {
-        # BLS 會擋 GitHub Actions 的預設 UA，偽裝成一般瀏覽器就會放行
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.bls.gov/",
-        "Connection": "keep-alive",
-    }
-
-    last_err = None
-    for url in urls:
+def _get_with_retries(url: str, headers: dict[str, str], timeout: int = 30, retries: int = 3, backoff_sec: float = 1.2) -> requests.Response:
+    last_err: Exception | None = None
+    for i in range(retries):
         try:
-            resp = requests.get(url, headers=headers, timeout=30)
+            resp = requests.get(url, headers=headers, timeout=timeout)
             resp.raise_for_status()
-            html = resp.text
-            break
+            return resp
         except Exception as e:
             last_err = e
-            html = None
+            # exponential-ish backoff
+            time.sleep(backoff_sec * (i + 1))
+    raise RuntimeError(f"HTTP request failed after {retries} retries: {url} ; last_err={last_err}")
 
-    if html is None:
-        raise RuntimeError(f"BLS schedule fetch failed (likely blocked). Last error: {last_err}")
 
-    soup = BeautifulSoup(html, "html.parser")
+# -----------------------
+# Data sources
+# -----------------------
 
-    cpi_tp: list[datetime] = []
-    nfp_tp: list[datetime] = []
+def fetch_bls_cpi_and_nfp(year: int) -> tuple[list[datetime], list[datetime]]:
+    """
+    BLS schedule page includes dates for CPI & Employment Situation (NFP).
+    Assumption:
+      - CPI: 08:30 ET
+      - Employment Situation: 08:30 ET
+    """
+    url = f"https://www.bls.gov/schedule/{year}/home.htm"
+    headers = dict(BROWSER_HEADERS)
+    headers["Referer"] = "https://www.bls.gov/"
 
-    rows = soup.select("table tbody tr")
-    if not rows:
-        raise RuntimeError("BLS schedule table not found; page structure may have changed.")
-
-    date_pat = re.compile(r"([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})")
-
-    for tr in rows:
-        cols = [td.get_text(" ", strip=True) for td in tr.find_all(["th", "td"])]
-        if len(cols) < 2:
-            continue
-        release, date_str = cols[0], cols[1]
-
-        m = date_pat.search(date_str)
-        if not m:
-            continue
-
-        dt_ny = datetime.strptime(m.group(0), "%B %d, %Y").replace(
-            hour=8, minute=30, second=0, tzinfo=TZ_NY
-        )
-        dt_tp = dt_ny.astimezone(TZ_TAIPEI)
-
-        if "Consumer Price Index" in release:
-            cpi_tp.append(dt_tp)
-
-        if "Employment Situation" in release:
-            nfp_tp.append(dt_tp)
-
-    return sorted(set(cpi_tp)), sorted(set(nfp_tp))
-
+    resp = _get_with_retries(url, headers=headers, retries=4)
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    cpi_tp: list[datetime] = []
-    nfp_tp: list[datetime] = []
-
-    # Typical structure: table with Release / Date columns
     rows = soup.select("table tbody tr")
     if not rows:
-        # fallback: sometimes schedule uses different markup; fail loudly for visibility in Actions logs
         raise RuntimeError("BLS schedule table not found; page structure may have changed.")
+
+    cpi_tp: list[datetime] = []
+    nfp_tp: list[datetime] = []
 
     date_pat = re.compile(r"([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})")
 
@@ -203,13 +192,14 @@ def fetch_bls_cpi_and_nfp(year: int) -> tuple[list[datetime], list[datetime]]:
         cols = [td.get_text(" ", strip=True) for td in tr.find_all(["th", "td"])]
         if len(cols) < 2:
             continue
-        release, date_str = cols[0], cols[1]
+        release = cols[0]
+        date_str = cols[1]
 
         m = date_pat.search(date_str)
         if not m:
             continue
 
-        # Build NY time 08:30 ET
+        # 08:30 ET
         dt_ny = datetime.strptime(m.group(0), "%B %d, %Y").replace(
             hour=8, minute=30, second=0, tzinfo=TZ_NY
         )
@@ -217,156 +207,194 @@ def fetch_bls_cpi_and_nfp(year: int) -> tuple[list[datetime], list[datetime]]:
 
         if "Consumer Price Index" in release:
             cpi_tp.append(dt_tp)
-
         if "Employment Situation" in release:
             nfp_tp.append(dt_tp)
 
-    return sorted(set(cpi_tp)), sorted(set(nfp_tp))
+    cpi_tp = sorted(set(cpi_tp))
+    nfp_tp = sorted(set(nfp_tp))
+
+    if not cpi_tp:
+        raise RuntimeError("BLS parse failed: CPI list empty (maybe page structure changed).")
+    if not nfp_tp:
+        raise RuntimeError("BLS parse failed: NFP list empty (maybe page structure changed).")
+
+    return cpi_tp, nfp_tp
+
 
 def fetch_bea_gdp_and_pio(year: int) -> tuple[list[datetime], list[datetime]]:
     """
-    Parse BEA release dates JSON for:
-    - Gross Domestic Product
-    - Personal Income and Outlays (includes PCE)
-    BEA JSON timestamps are ISO w/ UTC offset; convert to Taipei.
+    BEA release_dates.json structure is like:
+    {
+      "Gross Domestic Product": {"release_dates": [...]},
+      "Personal Income and Outlays": {"release_dates": [...]},
+      ...
+    }
+    Each date entry is ISO string with timezone offset.
     """
     url = "https://apps.bea.gov/API/signup/release_dates.json"
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
+    headers = dict(BROWSER_HEADERS)
+    headers["Accept"] = "application/json,text/plain,*/*"
+    headers["Referer"] = "https://www.bea.gov/"
 
+    resp = _get_with_retries(url, headers=headers, retries=4)
     data = resp.json()
-    items = data.get("release_dates", [])
-    if not items:
-        raise RuntimeError("BEA release_dates.json returned no items.")
 
-    gdp_tp: list[datetime] = []
-    pio_tp: list[datetime] = []
+    if not isinstance(data, dict) or not data:
+        raise RuntimeError("BEA release_dates.json unexpected empty or non-dict response.")
 
-    for item in items:
-        name = item.get("releaseName", "") or item.get("name", "")
-        dt_str = item.get("date")
-        if not dt_str:
-            continue
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", " ", s.strip()).lower()
 
-        try:
-            dt_utc = datetime.fromisoformat(dt_str)
-        except Exception:
-            continue
+    def _find_key(target: str) -> str | None:
+        # exact first
+        if target in data:
+            return target
+        t = _norm(target)
+        # case-insensitive exact
+        for k in data.keys():
+            if _norm(str(k)) == t:
+                return str(k)
+        # contains fallback
+        for k in data.keys():
+            if t in _norm(str(k)):
+                return str(k)
+        return None
 
-        if dt_utc.year != year:
-            continue
+    def _parse_dates(key: str) -> list[datetime]:
+        obj = data.get(key, {})
+        if not isinstance(obj, dict):
+            return []
+        raw_dates = obj.get("release_dates", [])
+        if not isinstance(raw_dates, list):
+            return []
+        out: list[datetime] = []
+        for s in raw_dates:
+            if not isinstance(s, str):
+                continue
+            try:
+                dt = datetime.fromisoformat(s)  # includes offset like +00:00
+            except Exception:
+                continue
+            if dt.year == year:
+                out.append(dt.astimezone(TZ_TAIPEI))
+        return sorted(set(out))
 
-        dt_tp = dt_utc.astimezone(TZ_TAIPEI)
+    gdp_key = _find_key("Gross Domestic Product")
+    pio_key = _find_key("Personal Income and Outlays")
 
-        if "Gross Domestic Product" in name:
-            gdp_tp.append(dt_tp)
+    if not gdp_key or not pio_key:
+        raise RuntimeError(f"BEA keys not found. GDP={gdp_key}, PIO={pio_key}")
 
-        if "Personal Income and Outlays" in name:
-            pio_tp.append(dt_tp)
+    gdp_tp = _parse_dates(gdp_key)
+    pio_tp = _parse_dates(pio_key)
 
-    return sorted(set(gdp_tp)), sorted(set(pio_tp))
+    if not gdp_tp:
+        raise RuntimeError("BEA parse failed: GDP list empty after filtering by year.")
+    if not pio_tp:
+        raise RuntimeError("BEA parse failed: PIO/PCE list empty after filtering by year.")
 
-def fomc_decision_days_2026() -> list[datetime]:
-    """
-    Hardcode FOMC decision (statement) dates for 2026 to avoid parsing issues.
-    Assume statement time 14:00 ET, convert to Taipei.
-    """
-    dates = [
-        "2026-01-28",
-        "2026-03-18",
-        "2026-04-29",
-        "2026-06-17",
-        "2026-07-29",
-        "2026-09-16",
-        "2026-10-28",
-        "2026-12-09",
-    ]
-    out = []
-    for d in dates:
+    return gdp_tp, pio_tp
+
+
+def fomc_statement_times_tp(year: int) -> list[datetime]:
+    if year != 2026:
+        raise RuntimeError("FOMC dates are hard-coded for 2026 only in this script.")
+    out: list[datetime] = []
+    for d in FOMC_STATEMENT_DATES_2026:
         dt_ny = datetime.fromisoformat(d + "T14:00:00").replace(tzinfo=TZ_NY)
         out.append(dt_ny.astimezone(TZ_TAIPEI))
     return out
 
 
-# ---------- Build calendar ----------
+# -----------------------
+# Build events / calendar
+# -----------------------
 
-def build_ics_2026() -> str:
-    lines: list[str] = [
+def build_events() -> list[Event]:
+    events: list[Event] = []
+
+    # CPI / NFP from BLS
+    cpi_tp, nfp_tp = fetch_bls_cpi_and_nfp(YEAR)
+
+    for dt_tp in cpi_tp:
+        events.append(Event(
+            summary="美國 CPI 公佈（BLS）",
+            start_tp=dt_tp,
+            duration_min=DEFAULT_DURATION_MIN,
+            description=f"來源：BLS schedule（{YEAR}；08:30 ET，已換算台北時間）",
+            categories=("US", "CPI", "BLS"),
+        ))
+
+    for dt_tp in nfp_tp:
+        events.append(Event(
+            summary="美國 非農/就業報告 NFP（BLS Employment Situation）",
+            start_tp=dt_tp,
+            duration_min=DEFAULT_DURATION_MIN,
+            description=f"來源：BLS schedule（{YEAR}；08:30 ET，已換算台北時間）",
+            categories=("US", "NFP", "BLS"),
+        ))
+
+    # FOMC hardcoded
+    for dt_tp in fomc_statement_times_tp(YEAR):
+        events.append(Event(
+            summary="FOMC 利率決議聲明（Fed）",
+            start_tp=dt_tp,
+            duration_min=FOMC_DURATION_MIN,
+            description=f"來源：Fed FOMC calendar（{YEAR}；假設 14:00 ET 發布，已換算台北時間）",
+            categories=("US", "FOMC", "Fed"),
+        ))
+
+    # BEA GDP / PCE (PIO)
+    gdp_tp, pio_tp = fetch_bea_gdp_and_pio(YEAR)
+
+    for dt_tp in gdp_tp:
+        events.append(Event(
+            summary="美國 GDP 發布（BEA）",
+            start_tp=dt_tp,
+            duration_min=DEFAULT_DURATION_MIN,
+            description=f"來源：BEA release_dates.json（{YEAR}；原始時間含時區，已換算台北時間）",
+            categories=("US", "GDP", "BEA"),
+        ))
+
+    for dt_tp in pio_tp:
+        events.append(Event(
+            summary="美國 PCE/個人所得與支出（BEA）",
+            start_tp=dt_tp,
+            duration_min=DEFAULT_DURATION_MIN,
+            description=f"來源：BEA release_dates.json（{YEAR}；含 PCE；已換算台北時間）",
+            categories=("US", "PCE", "BEA"),
+        ))
+
+    events.sort(key=lambda e: e.start_tp)
+    return events
+
+
+def build_ics(events: list[Event]) -> str:
+    header = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
         "PRODID:-//ZeusCheng//US Macro Calendar 2026//ZH-TW",
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
-        "X-WR-CALNAME:2026 重大美國金融數據（Taipei）",
+        f"X-WR-CALNAME:{YEAR} 重大美國金融數據（Taipei）",
         "X-WR-TIMEZONE:Asia/Taipei",
     ]
 
-    # BLS
-    cpi_tp, nfp_tp = fetch_bls_cpi_and_nfp(YEAR)
-    for dt_tp in cpi_tp:
-        add_event(
-            lines,
-            "美國 CPI 公佈（BLS）",
-            dt_tp,
-            duration_minutes=15,
-            description=f"來源：BLS schedule（{YEAR}；08:30 ET 已換算台北時間）",
-            categories=["US", "CPI", "BLS"],
-        )
-
-    for dt_tp in nfp_tp:
-        add_event(
-            lines,
-            "美國 非農/就業報告 NFP（BLS Employment Situation）",
-            dt_tp,
-            duration_minutes=15,
-            description=f"來源：BLS schedule（{YEAR}；08:30 ET 已換算台北時間）",
-            categories=["US", "NFP", "BLS"],
-        )
-
-    # FOMC
-    for dt_tp in fomc_decision_days_2026():
-        add_event(
-            lines,
-            "FOMC 利率決議聲明（Fed）",
-            dt_tp,
-            duration_minutes=30,
-            description=f"來源：Fed FOMC calendar（{YEAR}；假設 14:00 ET 發布，已換算台北時間）",
-            categories=["US", "FOMC", "Fed"],
-        )
-
-    # BEA
-    gdp_tp, pio_tp = fetch_bea_gdp_and_pio(YEAR)
-    for dt_tp in gdp_tp:
-        add_event(
-            lines,
-            "美國 GDP 發布（BEA）",
-            dt_tp,
-            duration_minutes=15,
-            description=f"來源：BEA release_dates.json（{YEAR}；UTC 時間已換算台北時間）",
-            categories=["US", "GDP", "BEA"],
-        )
-
-    for dt_tp in pio_tp:
-        add_event(
-            lines,
-            "美國 PCE/個人所得與支出（BEA）",
-            dt_tp,
-            duration_minutes=15,
-            description=f"來源：BEA release_dates.json（{YEAR}；含 PCE；UTC 時間已換算台北時間）",
-            categories=["US", "PCE", "BEA"],
-        )
+    lines = list(header)
+    for ev in events:
+        lines.extend(_event_to_ics_lines(ev))
 
     lines.append("END:VCALENDAR")
 
-    # Fold lines and ensure CRLF
     return "\r\n".join(_fold_ics_line(l) for l in lines) + "\r\n"
 
 
 def main():
-    ics_text = build_ics_2026()
+    events = build_events()
+    ics = build_ics(events)
     with open(OUT_FILE, "w", encoding="utf-8") as f:
-        f.write(ics_text)
-    print(f"✅ Generated {OUT_FILE}")
+        f.write(ics)
+    print(f"✅ Generated: {OUT_FILE} ({len(events)} events)")
 
 
 if __name__ == "__main__":
