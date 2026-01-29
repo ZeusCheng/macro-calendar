@@ -115,9 +115,76 @@ def fetch_bls_cpi_and_nfp(year: int) -> tuple[list[datetime], list[datetime]]:
     - Employment Situation (NFP)
     Default release time assumed 08:30 ET; convert to Taipei.
     """
-    url = f"https://www.bls.gov/schedule/{year}/home.htm"
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
+def fetch_bls_cpi_and_nfp(year: int) -> tuple[list[datetime], list[datetime]]:
+    """
+    Parse BLS schedule page for a given year.
+    - CPI (Consumer Price Index)
+    - Employment Situation (NFP)
+    Default release time assumed 08:30 ET; convert to Taipei.
+    """
+    urls = [
+        f"https://www.bls.gov/schedule/{year}/home.htm",
+        f"https://www.bls.gov/schedule/{year}/home.htm",  # 備援可留同一個（或你想改成 http 也行）
+    ]
+
+    headers = {
+        # BLS 會擋 GitHub Actions 的預設 UA，偽裝成一般瀏覽器就會放行
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.bls.gov/",
+        "Connection": "keep-alive",
+    }
+
+    last_err = None
+    for url in urls:
+        try:
+            resp = requests.get(url, headers=headers, timeout=30)
+            resp.raise_for_status()
+            html = resp.text
+            break
+        except Exception as e:
+            last_err = e
+            html = None
+
+    if html is None:
+        raise RuntimeError(f"BLS schedule fetch failed (likely blocked). Last error: {last_err}")
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    cpi_tp: list[datetime] = []
+    nfp_tp: list[datetime] = []
+
+    rows = soup.select("table tbody tr")
+    if not rows:
+        raise RuntimeError("BLS schedule table not found; page structure may have changed.")
+
+    date_pat = re.compile(r"([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})")
+
+    for tr in rows:
+        cols = [td.get_text(" ", strip=True) for td in tr.find_all(["th", "td"])]
+        if len(cols) < 2:
+            continue
+        release, date_str = cols[0], cols[1]
+
+        m = date_pat.search(date_str)
+        if not m:
+            continue
+
+        dt_ny = datetime.strptime(m.group(0), "%B %d, %Y").replace(
+            hour=8, minute=30, second=0, tzinfo=TZ_NY
+        )
+        dt_tp = dt_ny.astimezone(TZ_TAIPEI)
+
+        if "Consumer Price Index" in release:
+            cpi_tp.append(dt_tp)
+
+        if "Employment Situation" in release:
+            nfp_tp.append(dt_tp)
+
+    return sorted(set(cpi_tp)), sorted(set(nfp_tp))
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
